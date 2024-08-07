@@ -1,12 +1,9 @@
 ﻿using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using Azure;
 using eShopSupport.Backend.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
-using Npgsql.Internal;
 using StackExchange.Redis;
 
 namespace eShopSupport.Backend.Services;
@@ -27,21 +24,17 @@ public class TicketSummarizer(IServiceScopeFactory scopeFactory)
 
         try
         {
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var redisConnection = scope.ServiceProvider.GetRequiredService<IConnectionMultiplexer>();
             var chatCompletion = scope.ServiceProvider.GetRequiredService<IChatCompletionService>();
 
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var ticket = await db.Tickets
                 .Include(t => t.Product)
                 .Include(t => t.Messages)
                 .FirstOrDefaultAsync(t => t.TicketId == ticketId);
             if (ticket is not null)
             {
-                // The reason for prompting to express satisfation in words rather than numerically, and forcing it to generate a summary
-                // of the customer's words before doing so, are necessary prompt engineering techniques. If it's asked to generate sentiment
-                // score without first summarizing the customer's words, then it scores the agent's response even when told not to. If it's
-                // asked to score numerically, it produces wildly random scores - it's much better with words than numbers.
-                string[] satisfactionScores = ["AbsolutelyFurious", "VeryUnhappy", "Unhappy", "Disappointed", "Indifferent", "Pleased", "Happy", "Delighted", "UnspeakablyThrilled"];
+                string[] satisfactionScores = ["AbsolutelyFurious", "VeryUnhappy", "Unhappy",
+                    "Disappointed", "Indifferent", "Pleased", "Happy", "Delighted", "UnspeakablyThrilled"];
 
                 var product = ticket.Product;
                 var prompt = $$"""
@@ -69,8 +62,7 @@ public class TicketSummarizer(IServiceScopeFactory scopeFactory)
                     2. A shorter summary that is up to 8 words long. This functions as a title for the ticket,
                        so the goal is to distinguish what's unique about this ticket.
 
-                    3. A 10-word summary of the latest thing the CUSTOMER has said, ignoring any agent messages. Then, based
-                       ONLY on tenWordsSummarizingOnlyWhatCustomerSaid, score the customer's satisfaction using one of the following
+                    3. Based ONLY on what the customer said (not the support agent), score the customer's satisfaction using one of the following
                        phrases ranked from worst to best:
                        {{string.Join(", ", satisfactionScores)}}.
                        Pay particular attention to the TONE of the customer's messages, as we are most interested in their emotional state.
@@ -80,7 +72,6 @@ public class TicketSummarizer(IServiceScopeFactory scopeFactory)
                     Respond as JSON in the following form: {
                       "longSummary": "string",
                       "shortSummary": "string",
-                      "tenWordsSummarizingOnlyWhatCustomerSaid": "string",
                       "customerSatisfaction": "string"
                     }
                     """;
@@ -93,9 +84,6 @@ public class TicketSummarizer(IServiceScopeFactory scopeFactory)
                     Seed = 0,
                 });
 
-                // Due to what seems like a server-side bug, when asking for a json_object response and with tools enabled,
-                // it often replies with two or more JSON objects concatenated together (duplicates or slight variations).
-                // As a workaround, just read the first complete JSON object from the response.
                 var responseString = response.ToString();
                 var parsed = ReadAndDeserializeSingleValue<Response>(responseString, SerializerOptions)!;
 
@@ -112,6 +100,8 @@ public class TicketSummarizer(IServiceScopeFactory scopeFactory)
                     .SetProperty(t => t.LongSummary, longSummary)
                     .SetProperty(t => t.CustomerSatisfaction, satisfactionScore));
 
+                // Issue notification
+                var redisConnection = scope.ServiceProvider.GetRequiredService<IConnectionMultiplexer>();
                 await redisConnection.GetSubscriber().PublishAsync(
                     RedisChannel.Literal($"ticket:{ticketId}"), "Updated");
             }
